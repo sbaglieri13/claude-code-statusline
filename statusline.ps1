@@ -69,6 +69,34 @@ $pct = [int][math]::Min(100, [math]::Round($usedPct))
 $tokenTotalStr = if ($null -ne $usedTok) { fmtTok($usedTok) } else { '0' }
 $tokenLimitStr = fmtTok($totalTok)
 
+$rl = if ($data) { $data.rate_limits } else { $null }
+
+# FALLBACK — read transcript JSONL if context or rate limits are missing
+if (($usedPct -eq 0 -or $null -eq $rl) -and $data -and $data.transcript_path -and (Test-Path $data.transcript_path)) {
+    try {
+        $lines = Get-Content $data.transcript_path -Tail 30 -ErrorAction Stop
+        $needCtx = ($usedPct -eq 0)
+        $needRl  = ($null -eq $rl)
+        foreach ($line in ($lines | Sort-Object -Descending)) {
+            $entry = $line | ConvertFrom-Json -ErrorAction SilentlyContinue
+            if ($needCtx -and $entry -and $entry.context_window -and $null -ne $entry.context_window.used_percentage -and [double]$entry.context_window.used_percentage -gt 0) {
+                $usedPct = [double]$entry.context_window.used_percentage
+                if ($null -eq $usedTok -and $entry.context_window.total_input_tokens) {
+                    $usedTok = [long]$entry.context_window.total_input_tokens + [long]$entry.context_window.total_output_tokens
+                }
+                $needCtx = $false
+            }
+            if ($needRl -and $entry -and $entry.rate_limits) {
+                $rl = $entry.rate_limits
+                $needRl = $false
+            }
+            if (-not $needCtx -and -not $needRl) { break }
+        }
+        $pct = [int][math]::Min(100, [math]::Round($usedPct))
+        $tokenTotalStr = if ($null -ne $usedTok) { fmtTok($usedTok) } else { '0' }
+    } catch {}
+}
+
 # PROGRESS BAR
 $barColor = threshColor($pct)
 $barWidth = 10
@@ -77,10 +105,14 @@ $barFull = [string][char]0x25CF   # ●
 $barEmpty = [string][char]0x25CB  # ○
 $bar = ($barColor + $barFull * $filled) + ($cloudy + $barEmpty * ($barWidth - $filled))
 
-# RATE LIMITS
-$rl = if ($data) { $data.rate_limits } else { $null }
+# RATE LIMITS — fallback from cache file if $rl is missing
+$rlCachePath = "$env:TEMP\claude-rl-cache.json"
+if (-not $rl -and (Test-Path $rlCachePath)) {
+    try { $rl = Get-Content $rlCachePath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop } catch {}
+}
 $usageStr = ""; $resetStr = ""
 if ($rl) {
+    try { $rl | ConvertTo-Json -Compress -ErrorAction Stop | Out-File $rlCachePath -Encoding utf8 -Force } catch {}
     $uParts = @(); $rParts = @()
     if ($rl.five_hour -and $null -ne $rl.five_hour.used_percentage) {
         $p = [int]$rl.five_hour.used_percentage
@@ -122,7 +154,11 @@ try {
     }
 } catch {}
 
-$ctxSection = "${barColor}${iBrain} Context ${bar}${barColor} ${pct}%${reset} ${cloudy}(${tokenTotalStr}/${tokenLimitStr})${reset}"
+$ctxSection = if ($pct -eq 0 -and ($null -eq $usedTok -or $usedTok -eq 0)) {
+    "${cloudy}${iBrain} Context ${barEmpty * $barWidth} --${reset}"
+} else {
+    "${barColor}${iBrain} Context ${bar}${barColor} ${pct}%${reset} ${cloudy}(${tokenTotalStr}/${tokenLimitStr})${reset}"
+}
 
 $line1 = "${cyan}${iRobot} $mName${reset} ${cloudy}| ${yellow}${iFolder} $folder${reset}${gitStatus}${timerStr}"
 $line2 = "$ctxSection"
