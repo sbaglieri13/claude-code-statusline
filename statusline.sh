@@ -237,12 +237,19 @@ TIMER_STR=""
 if [ -f "$TIMER_FILE" ]; then
     START_MS=$(cat "$TIMER_FILE" 2>/dev/null | tr -d '[:space:]')
     if [ -n "$START_MS" ]; then
-        NOW_MS=$(awk 'BEGIN { srand(); printf "%d", systime()*1000 }')
+        NOW_MS=$(( $(date +%s) * 1000 ))
         # Prefer higher-precision now
         if command -v perl >/dev/null 2>&1; then
             NOW_MS=$(perl -MTime::HiRes=time -e 'printf "%d", time*1000')
         elif date +%N 2>/dev/null | grep -q '^[0-9]'; then
             NOW_MS=$(date +%s%3N)
+        fi
+        # Freeze at the last transcript write so the value is this turn's duration, not time since the prompt
+        if [ -n "$TRANSCRIPT" ] && [ -f "$TRANSCRIPT" ]; then
+            T_SEC=$(stat -c %Y "$TRANSCRIPT" 2>/dev/null || stat -f %m "$TRANSCRIPT" 2>/dev/null)
+            if [ -n "$T_SEC" ] && [ $((T_SEC * 1000)) -gt "$START_MS" ] && [ $((T_SEC * 1000)) -lt "$NOW_MS" ]; then
+                NOW_MS=$((T_SEC * 1000))
+            fi
         fi
         DELTA=$((NOW_MS - START_MS))
         if [ "$DELTA" -gt 500 ] && [ "$DELTA" -lt 600000 ]; then

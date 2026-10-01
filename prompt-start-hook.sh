@@ -25,5 +25,5 @@ elif [ -n "${EPOCHREALTIME:-}" ]; then
     awk -v t="$EPOCHREALTIME" 'BEGIN { printf "%d", t*1000 }' > "$OUT"
 else
     # Fallback: seconds → ms
-    awk 'BEGIN { printf "%d", systime()*1000 }' > "$OUT"
+    printf "%d" $(( $(date +%s) * 1000 )) > "$OUT"
 fi

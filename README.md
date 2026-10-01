@@ -55,10 +55,12 @@ The installer needs these tools available in your shell:
 #### Installing jq on Windows (Git Bash, no admin required)
 
 ```bash
-curl -L -o /usr/local/bin/jq https://github.com/jqlang/jq/releases/latest/download/jq-windows-amd64.exe
-chmod +x /usr/local/bin/jq
+mkdir -p ~/bin && curl -L -o ~/bin/jq.exe https://github.com/jqlang/jq/releases/latest/download/jq-windows-amd64.exe
+chmod +x ~/bin/jq.exe
 jq --version
 ```
+
+Open a new Git Bash window afterwards so `~/bin` is on your PATH.
 
 Or via package managers if available:
 
@@ -86,12 +88,12 @@ bash install.sh
 The installer:
 
 - Detects your OS (Linux / macOS / Windows-GitBash / WSL).
-- Copies `statusline.sh` and `prompt-start-hook.sh` into `~/.claude/` and makes them executable.
+- Copies `statusline.sh` and `prompt-start-hook.sh` into `~/.claude/` and makes them executable. The installer refuses to overwrite files there that it did not install.
 - **Smart-merges** `~/.claude/settings.json`:
   - Backs up the existing file as `settings.json.bak.<timestamp>` before touching anything.
-  - Adds the `statusLine` key only if you don't already have one (or replaces it only if it was previously installed by this script).
-  - Appends a single entry to `hooks.UserPromptSubmit` without removing or modifying any other hooks you've configured.
-  - Marks every entry it adds with `"_managed": "claude-code-statusline"` so `--uninstall` can remove exactly those entries later.
+  - Adds or updates `statusLine` only if you have none or it is ours. If you already use another status line it is left untouched, the prompt hook is not added, and the installer warns that the statusline is not active.
+  - Keeps exactly one hook entry of ours in `hooks.UserPromptSubmit` without removing or modifying any other hooks you have configured.
+  - Recognises its own entries by command path (older installs that carry a `"_managed"` marker are also recognised and migrated), so re-running never creates duplicates and `--uninstall` removes exactly those entries.
 
 ### 3. Restart Claude Code
 
@@ -114,15 +116,15 @@ bash install.sh --uninstall
 This:
 
 - Removes the `statusLine` key only if it's the one this script installed.
-- Removes only the `hooks.UserPromptSubmit` entries marked as managed by this script (your other hooks stay intact).
+- Removes only our hook (matched by command, or by the legacy `_managed` marker); your other hooks stay intact.
 - Prunes empty `hooks.UserPromptSubmit` / `hooks` containers.
-- Deletes `~/.claude/statusline.sh` and `~/.claude/prompt-start-hook.sh`.
+- Deletes `~/.claude/statusline.sh` and `~/.claude/prompt-start-hook.sh` (only if they are ours, and only after `settings.json` was written).
 - Leaves any `settings.json.bak.*` backups in place — delete them yourself once you're sure you don't need them.
 
 ## How it works
 
 - `statusline.sh` reads a JSON payload on stdin from Claude Code each time the status line refreshes, then prints two ANSI-coloured lines.
-- `prompt-start-hook.sh` runs on every `UserPromptSubmit` and writes a millisecond timestamp to `$TMPDIR/claude-prompt-start.txt`; the statusline reads it back to compute the ⚡ response time.
+- `prompt-start-hook.sh` runs on every `UserPromptSubmit` and writes a millisecond timestamp to `$TMPDIR/claude-prompt-start-<session_id>.txt`; the statusline reads it back to compute the ⚡ response time.
 - Rate-limit data is cached in `$TMPDIR/claude-rl-cache.json` so the 🔋 / ⏳ values stay visible across refreshes that don't include fresh limits.
 
 ## License

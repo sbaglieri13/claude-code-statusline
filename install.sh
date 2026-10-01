@@ -1,11 +1,9 @@
 #!/usr/bin/env bash
 # Claude Code Statusline — smart cross-platform installer.
-# Detects Linux / macOS / Windows (Git Bash, WSL) and merges settings.json
-# without overwriting unrelated keys or existing hooks.
+# Merges settings.json without overwriting unrelated keys or hooks.
 
 set -euo pipefail
 
-# ── ARGS ──────────────────────────────────────────────────────────────────
 ACTION="install"
 DRY_RUN=0
 for arg in "$@"; do
@@ -17,7 +15,7 @@ for arg in "$@"; do
 Usage: ./install.sh [--uninstall] [--dry-run]
 
   (no args)     Install statusline + prompt hook.
-  --uninstall   Remove only entries this script added (marker-based).
+  --uninstall   Remove only entries this script added (matched by exact command, plus the legacy "_managed" marker).
   --dry-run     Show what would change without writing.
 EOF
             exit 0
@@ -29,7 +27,6 @@ EOF
     esac
 done
 
-# ── COLORS ────────────────────────────────────────────────────────────────
 if [ -t 1 ]; then
     C_OK=$'\033[32m'; C_WARN=$'\033[33m'; C_ERR=$'\033[31m'; C_DIM=$'\033[2m'; C_BOLD=$'\033[1m'; C_RST=$'\033[0m'
 else
@@ -41,20 +38,17 @@ warn() { printf "%s!%s %s\n" "$C_WARN" "$C_RST" "$*"; }
 err() { printf "%s✗%s %s\n" "$C_ERR" "$C_RST" "$*" >&2; }
 step() { printf "\n%s%s%s\n" "$C_BOLD" "$*" "$C_RST"; }
 
-# ── OS DETECTION ──────────────────────────────────────────────────────────
 UNAME=$(uname -s 2>/dev/null || echo unknown)
 case "$UNAME" in
     Linux*) OS="linux" ;;
     Darwin*) OS="macos" ;;
-    MINGW*|MSYS*|CYGWIN*) OS="windows" ;; # Git Bash / MSYS2 / Cygwin
+    MINGW*|MSYS*|CYGWIN*) OS="windows" ;;
     *) OS="unknown" ;;
 esac
-# WSL is detected as Linux but reports a /proc marker
 if [ "$OS" = "linux" ] && grep -qi microsoft /proc/version 2>/dev/null; then
     OS="wsl"
 fi
 
-# ── DEPS ──────────────────────────────────────────────────────────────────
 MISSING=()
 for cmd in bash jq git; do
     command -v "$cmd" >/dev/null 2>&1 || MISSING+=("$cmd")
@@ -67,7 +61,6 @@ if [ ${#MISSING[@]} -gt 0 ]; then
                    log "  Arch : sudo pacman -S ${MISSING[*]}" ;;
         macos)     log "  Homebrew : brew install ${MISSING[*]}" ;;
         windows)
-            # Show specific hint only for jq since bash+git come from Git for Windows
             if printf '%s\n' "${MISSING[@]}" | grep -q '^jq$'; then
                 log "  Install jq: winget install jqlang.jq"
                 log "  Or see: https://stedolan.github.io/jq/download/"
@@ -80,7 +73,6 @@ if [ ${#MISSING[@]} -gt 0 ]; then
     exit 1
 fi
 
-# ── PATHS ─────────────────────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CLAUDE_DIR="$HOME/.claude"
 SETTINGS="$CLAUDE_DIR/settings.json"
@@ -89,16 +81,16 @@ HOOK_SRC="$SCRIPT_DIR/prompt-start-hook.sh"
 STATUSLINE_DST="$CLAUDE_DIR/statusline.sh"
 HOOK_DST="$CLAUDE_DIR/prompt-start-hook.sh"
 
-# ── COMMAND STRINGS (resolved at install time, written into settings.json)
-# On all platforms we embed the POSIX path — bash (Git Bash / WSL / Linux / macOS)
-# always accepts POSIX paths even on Windows. cygpath -w would give backslash paths
-# that break when bash re-interprets them as escape sequences.
+# Embed POSIX paths: bash accepts them on Windows too, backslash paths break.
 STATUSLINE_CMD="bash \"$STATUSLINE_DST\""
 HOOK_CMD="bash \"$HOOK_DST\""
 
+# Legacy marker: older installs tagged their entries with "_managed". We never write
+# it anymore, but still recognise it so those entries can be migrated or removed.
 MARKER="claude-code-statusline"
+SIG_STATUSLINE="# Claude Code statusline — cross-platform"
+SIG_HOOK="Records prompt-start timestamp"
 
-# ── INFO ──────────────────────────────────────────────────────────────────
 step "Detected"
 log "  OS              : $OS ($UNAME)"
 log "  Claude dir      : $CLAUDE_DIR"
@@ -107,7 +99,6 @@ log "  Statusline cmd  : $STATUSLINE_CMD"
 log "  Hook cmd        : $HOOK_CMD"
 [ "$DRY_RUN" -eq 1 ] && warn "Dry-run mode — no files will be written"
 
-# ── SETTINGS HELPERS ──────────────────────────────────────────────────────
 ensure_settings_dir() {
     [ "$DRY_RUN" -eq 1 ] && return
     mkdir -p "$CLAUDE_DIR"
@@ -151,59 +142,86 @@ write_settings() {
     ok "Wrote $SETTINGS"
 }
 
-# Merge: set statusLine (with marker) and append our hook entry if not already present.
+JQ_DEFS='
+def sl_cmd: if (.statusLine | type) == "object" then (.statusLine.command // null) else null end;
+def sl_mk:  if (.statusLine | type) == "object" then (.statusLine._managed // null) else null end;
+def sl_ours: (sl_cmd == $sl) or (sl_mk == $mk);
+def sl_foreign: (.statusLine != null) and (sl_ours | not);
+# Drop our hooks; remove an entry only if it became empty because of that.
+def strip_ours:
+    map(
+        if (type == "object") and (._managed == $mk) then empty
+        elif (type == "object") and ((.hooks | type) == "array") then
+            (.hooks) as $h
+            | ($h | map(select((.command? // null) != $hk))) as $n
+            | if ($n | length) == 0 and ($h | length) > 0 then empty else .hooks = $n end
+        else . end
+    );
+'
+
+statusline_is_foreign() {
+    jq -r --arg sl "$STATUSLINE_CMD" --arg mk "$MARKER" \
+        "$JQ_DEFS"'if sl_foreign then "yes" else "no" end'
+}
+
 merge_install() {
     jq \
         --arg sl "$STATUSLINE_CMD" \
         --arg hk "$HOOK_CMD" \
         --arg mk "$MARKER" \
-        '
-        # statusLine: replace only if absent OR already marked as ours (preserve user-customized one)
-        if (.statusLine == null) or (.statusLine._managed == $mk) then
-            .statusLine = { type: "command", command: $sl, _managed: $mk }
-        else
-            .
-        end
-        |
-        # hooks.UserPromptSubmit: ensure shape, then append our entry only if no entry with our marker exists
-        .hooks //= {}
-        | .hooks.UserPromptSubmit //= []
-        | if any(.hooks.UserPromptSubmit[]?; ._managed == $mk) then
-              # Update existing managed entry in place (in case command path changed)
-              .hooks.UserPromptSubmit |= map(
-                  if ._managed == $mk then
-                      { _managed: $mk, hooks: [ { type: "command", command: $hk, shell: "bash", async: true } ] }
-                  else . end
-              )
-          else
-              .hooks.UserPromptSubmit += [
-                  { _managed: $mk, hooks: [ { type: "command", command: $hk, shell: "bash", async: true } ] }
-              ]
-          end
+        "$JQ_DEFS"'
+        .statusLine = { type: "command", command: $sl }
+        | .hooks //= {}
+        | .hooks.UserPromptSubmit = (
+            ((.hooks.UserPromptSubmit // []) | if type == "array" then . else [.] end | strip_ours)
+            + [ { hooks: [ { type: "command", command: $hk, shell: "bash", async: true } ] } ]
+          )
         '
 }
 
-# Uninstall: drop our statusLine if marked, drop hook entries with our marker, prune empty containers.
 merge_uninstall() {
     jq \
+        --arg sl "$STATUSLINE_CMD" \
+        --arg hk "$HOOK_CMD" \
         --arg mk "$MARKER" \
-        '
-        # statusLine
-        if (.statusLine? // {} | ._managed) == $mk then
-            del(.statusLine)
-        else . end
-        |
-        # hook entries
-        if (.hooks?.UserPromptSubmit?) then
-            .hooks.UserPromptSubmit |= map(select(._managed != $mk))
-            | if (.hooks.UserPromptSubmit | length) == 0 then del(.hooks.UserPromptSubmit) else . end
-            | if (.hooks | length) == 0 then del(.hooks) else . end
-        else . end
+        "$JQ_DEFS"'
+        if sl_ours then del(.statusLine) else . end
+        | if (.hooks | type) == "object" and ((.hooks.UserPromptSubmit | type) == "array") then
+              .hooks.UserPromptSubmit |= strip_ours
+              | if (.hooks.UserPromptSubmit | length) == 0 then del(.hooks.UserPromptSubmit) else . end
+              | if (.hooks | length) == 0 then del(.hooks) else . end
+          else . end
         '
 }
 
-# ── INSTALL ───────────────────────────────────────────────────────────────
+is_ours() {
+    cmp -s "$1" "$2" || head -n 3 "$2" 2>/dev/null | grep -qF -- "$3"
+}
+
+# Refuse to overwrite third-party files. Runs before any backup or copy.
+check_destinations() {
+    local bad=0
+    if [ -e "$STATUSLINE_DST" ] && ! is_ours "$STATUSLINE_SRC" "$STATUSLINE_DST" "$SIG_STATUSLINE"; then
+        err "$STATUSLINE_DST exists and was not installed by this script."
+        bad=1
+    fi
+    if [ -e "$HOOK_DST" ] && ! is_ours "$HOOK_SRC" "$HOOK_DST" "$SIG_HOOK"; then
+        err "$HOOK_DST exists and was not installed by this script."
+        bad=1
+    fi
+    if [ "$bad" -eq 1 ]; then
+        log "  Rename or move the file(s) above, then re-run the installer. Nothing was changed."
+        exit 1
+    fi
+}
+
 do_install() {
+    check_destinations
+
+    local current foreign new
+    current=$(read_settings)
+    foreign=$(printf '%s' "$current" | statusline_is_foreign)
+
     step "Copying files → $CLAUDE_DIR"
     if [ "$DRY_RUN" -eq 1 ]; then
         warn "Would copy: statusline.sh, prompt-start-hook.sh"
@@ -214,13 +232,22 @@ do_install() {
         ok "Copied statusline.sh + prompt-start-hook.sh (executable)"
     fi
 
+    if [ "$foreign" = "yes" ]; then
+        step "Settings left untouched"
+        warn "Another statusLine is already configured, so settings.json was not modified"
+        warn "and the prompt hook was not added. Existing command:"
+        log "    $(printf '%s' "$current" | jq -r '(.statusLine.command? // (.statusLine | tojson))')"
+        log "  To activate this statusline, set statusLine.command in $SETTINGS to:"
+        log "    $STATUSLINE_CMD"
+        log "  (and add a UserPromptSubmit hook running: $HOOK_CMD)"
+        step "Done"
+        warn "The statusline is NOT active."
+        return
+    fi
+
     step "Merging $SETTINGS"
     backup_settings
-    local current new
-    current=$(read_settings)
-    new=$(printf '%s' "$current" | merge_install)
-    # Pretty-print
-    new=$(printf '%s' "$new" | jq '.')
+    new=$(printf '%s' "$current" | merge_install | jq '.')
     write_settings "$new"
 
     step "Done"
@@ -229,9 +256,8 @@ do_install() {
     fi
 }
 
-# ── UNINSTALL ─────────────────────────────────────────────────────────────
 do_uninstall() {
-    step "Removing managed entries from $SETTINGS"
+    step "Removing our entries from $SETTINGS"
     if [ ! -f "$SETTINGS" ]; then
         warn "No settings.json found — nothing to clean."
     else
@@ -242,21 +268,24 @@ do_uninstall() {
         write_settings "$new"
     fi
 
+    # Files are removed only after settings.json was written successfully (set -e aborts otherwise).
     step "Removing copied files"
+    local f src sig
     for f in "$STATUSLINE_DST" "$HOOK_DST"; do
-        if [ -f "$f" ]; then
-            if [ "$DRY_RUN" -eq 1 ]; then
-                warn "Would remove $f"
-            else
-                rm -f "$f"; ok "Removed $f"
-            fi
+        [ -f "$f" ] || continue
+        if [ "$f" = "$STATUSLINE_DST" ]; then src="$STATUSLINE_SRC"; sig="$SIG_STATUSLINE"; else src="$HOOK_SRC"; sig="$SIG_HOOK"; fi
+        if ! is_ours "$src" "$f" "$sig"; then
+            warn "Skipping $f (not installed by this script)"
+        elif [ "$DRY_RUN" -eq 1 ]; then
+            warn "Would remove $f"
+        else
+            rm -f "$f"; ok "Removed $f"
         fi
     done
 
     step "Done"
 }
 
-# ── MAIN ──────────────────────────────────────────────────────────────────
 case "$ACTION" in
     install) do_install ;;
     uninstall) do_uninstall ;;
